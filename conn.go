@@ -203,12 +203,23 @@ func DialOpen(d Dialer, name string) (_ driver.Conn, err error) {
 		}
 	}
 
+	var idleTimeout time.Duration
+	if timeout := o.Get("read_timeout"); timeout != "" && timeout != "0" {
+		seconds, err := strconv.ParseInt(timeout, 10, 0)
+		if err != nil {
+			return nil, fmt.Errorf("invalid value for parameter read_timeout: %s", err)
+		}
+		idleTimeout = time.Duration(seconds) * time.Second
+	}
+
 	c, err := dial(d, o)
 	if err != nil {
 		return nil, err
 	}
 
-	cn := &conn{c: c}
+	// Wrap with read timeout connection
+	rtc := &rtConn{Conn: c}
+	cn := &conn{c: rtc}
 	cn.ssl(o)
 	cn.buf = bufio.NewReader(cn.c)
 	cn.startup(o)
@@ -216,7 +227,38 @@ func DialOpen(d Dialer, name string) (_ driver.Conn, err error) {
 	if timeout := o.Get("connect_timeout"); timeout != "" && timeout != "0" {
 		err = cn.c.SetDeadline(time.Time{})
 	}
+	// wrap with rtConn if read_timeout was set
+	if idleTimeout > 0 {
+		rtc.SetTimeout(idleTimeout)
+	}
 	return cn, err
+}
+
+// rtConn is a net.Conn that maintain max idle period for a connection.
+type rtConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *rtConn) SetTimeout(timeout time.Duration) {
+	c.timeout = timeout
+	c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
+}
+
+func (c *rtConn) Read(b []byte) (n int, err error) {
+	n, err = c.Conn.Read(b)
+	if c.timeout > 0 && err == nil {
+		c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
+	}
+	return
+}
+
+func (c *rtConn) Write(b []byte) (n int, err error) {
+	n, err = c.Conn.Write(b)
+	if c.timeout > 0 && err == nil {
+		c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
+	}
+	return
 }
 
 func dial(d Dialer, o values) (net.Conn, error) {
@@ -966,6 +1008,8 @@ func isDriverSetting(key string) bool {
 	case "fallback_application_name":
 		return true
 	case "connect_timeout":
+		return true
+	case "read_timeout":
 		return true
 
 	default:
