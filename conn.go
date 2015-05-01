@@ -203,13 +203,23 @@ func DialOpen(d Dialer, name string) (_ driver.Conn, err error) {
 		}
 	}
 
-	var idleTimeout time.Duration
+	var readTimeout time.Duration
 	if timeout := o.Get("read_timeout"); timeout != "" && timeout != "0" {
-		seconds, err := strconv.ParseInt(timeout, 10, 0)
+		seconds, err := strconv.ParseFloat(timeout, 32)
 		if err != nil {
 			return nil, fmt.Errorf("invalid value for parameter read_timeout: %s", err)
 		}
-		idleTimeout = time.Duration(seconds) * time.Second
+		readTimeout = time.Duration(seconds * float64(time.Second))
+	}
+
+	// Parse statement timeout (in milliseconds)
+	var statementTimeout time.Duration
+	if timeout := o.Get("statement_timeout"); timeout != "" && timeout != "0" {
+		seconds, err := strconv.ParseFloat(timeout, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid value for parameter statement_timeout: %s", err)
+		}
+		statementTimeout = time.Duration(seconds * float64(time.Second))
 	}
 
 	c, err := dial(d, o)
@@ -228,9 +238,22 @@ func DialOpen(d Dialer, name string) (_ driver.Conn, err error) {
 		err = cn.c.SetDeadline(time.Time{})
 	}
 	// wrap with rtConn if read_timeout was set
-	if idleTimeout > 0 {
-		rtc.SetTimeout(idleTimeout)
+	if readTimeout > 0 {
+		rtc.SetTimeout(readTimeout)
+		// If statement timeout is not set, set it to readTimeout.
+		// This will prevent hanging transactions after connection was dropped.
+		if statementTimeout <= 0 {
+			statementTimeout = readTimeout
+		}
 	}
+	// set statement timeout (in milliseconds) if requested
+	if statementTimeout > 0 {
+		_, _, err := cn.simpleExec(fmt.Sprintf("set statement_timeout to %d", statementTimeout/time.Millisecond))
+		if err != nil {
+			errorf("failed to set statement_timeout: %s", err)
+		}
+	}
+
 	return cn, err
 }
 
@@ -1010,6 +1033,8 @@ func isDriverSetting(key string) bool {
 	case "connect_timeout":
 		return true
 	case "read_timeout":
+		return true
+	case "statement_timeout":
 		return true
 
 	default:
